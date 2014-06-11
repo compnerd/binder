@@ -1,0 +1,258 @@
+#!/usr/bin/python
+# -*- encoding: utf-8 -*-
+# vim: set expandtab filetype=python shiftwidth=2 softtabstop=2 tabstop=8 :
+# Copyright (c) 2014 Saleem Abdulrasool <compnerd@compnerd.org>
+
+import re
+import sys
+import argparse
+
+from clang.cindex import AccessSpecifier, CursorKind, Diagnostic, Index
+
+EXIT_SUCCESS, EXIT_FAILURE = xrange(2)
+
+def c_name(name):
+  name = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', name)
+  name = re.sub(r'([a-z\d])([A-Z])', r'\1_\2', name)
+  return name.replace('-', '_').lower()
+
+def qualified_name(cursor):
+  components = [cursor.spelling]
+  parent = cursor.semantic_parent
+  while parent:
+    if not parent.spelling:
+      break
+    components.append(parent.spelling)
+    parent = parent.semantic_parent
+  components.reverse()
+  return '::'.join(components) if components else ''
+
+class Method(object):
+  def __init__(self, cursor, parent):
+    self.arguments_ = [
+      (arg.type.spelling, arg.spelling) for arg in cursor.get_arguments()
+    ]
+    self.name_ = cursor.spelling
+    self.parent_ = parent
+    self.qualified_name_ = qualified_name(cursor)
+    self.result_type_ = cursor.result_type.spelling
+
+  @property
+  def name(self):
+    return self.name_
+
+  @property
+  def qualified_name(self):
+    return self.qualified_name_
+
+  def generate_code(self, transform):
+    header_template = '''%(result_type)s
+%(method_name)s(%(struct_name)s * %(struct_this)s%(method_args)s);
+'''
+
+    implementation_template = '''%(result_type)s
+%(method_name)s(%(struct_name)s * %(struct_this)s%(method_args)s) {
+  return %(struct_this)s->%(member_name)s_.%(wrapped_fun)s(%(params_name)s);
+}
+'''
+
+    method_args = ', '.join([
+      '%s %s' % (transform(type), name) for (type, name) in self.arguments_
+    ])
+    if method_args:
+      method_args = ', ' + method_args
+
+    params = ', '.join([ transform(name) for (type, name) in self.arguments_ ])
+
+    parameters = {
+      'result_type' : self.result_type_,
+      'method_name' : c_name('_'.join(map(transform, self.qualified_name.split('::')))),
+      'struct_name' : c_name('_'.join(map(transform, self.parent_.qualified_name.split('::')))),
+      'struct_this' : c_name(transform(self.parent_.name)),
+      'method_args' : method_args,
+      'member_name' : c_name(transform(self.parent_.name)),
+      'wrapped_fun' : self.name,
+      'params_name' : params,
+    }
+
+    print(implementation_template % parameters)
+
+class Class(object):
+  def __init__(self):
+    self.constructors = []
+    self.destructors = []
+    self.methods = []
+
+  @property
+  def name(self):
+    return self.name_
+
+  @property
+  def qualified_name(self):
+    return self.qualified_name_
+
+  def parse(self, cursor):
+    self.name_ = cursor.spelling
+    self.qualified_name_ = qualified_name(cursor)
+
+    parsers = { CursorKind.CONSTRUCTOR : self._parse_constructor,
+                CursorKind.CXX_METHOD : self._parse_method,
+                CursorKind.DESTRUCTOR : self._parse_destructor }
+
+    for child in cursor.get_children():
+      parse = parsers.get(child.kind)
+      if parse:
+        parse(child)
+
+  def _parse_constructor(self, cursor):
+    if not cursor.access_specifier == AccessSpecifier.PUBLIC:
+      return
+    self.constructors.append(Method(cursor, self))
+
+  def _parse_method(self, cursor):
+    if not cursor.access_specifier == AccessSpecifier.PUBLIC:
+      return
+    self.methods.append(Method(cursor, self))
+
+  def _parse_destructor(self, cursor):
+    if not cursor.access_specifier == AccessSpecifier.PUBLIC:
+      return
+    self.destructors.append(Method(cursor, self))
+
+  def generate_code(self, transform):
+    header_template = '''typedef struct %(struct_name)s %(struct_name)s;
+'''
+
+    implementation_template = '''struct %(struct_name)s {
+  %(type)s %(member)s_;
+};
+'''
+
+    parameters = {
+      'member' : c_name(transform(self.name)),
+      'struct_name' : c_name('_'.join(map(transform, self.qualified_name.split('::')))),
+      'type' : self.name
+    }
+
+    print(implementation_template % parameters)
+
+    for method in self.methods:
+      if method.name in ('operator=', 'operator==', 'operator!='):
+        print('/* %s elided */\n' % method.name)
+        continue
+      method.generate_code(transform)
+
+class Namespace(object):
+  def __init__(self):
+    self.namespaces_ = { }
+    self.classes = { }
+
+  @property
+  def name(self):
+    return self.name_
+
+  @property
+  def namespaces(self):
+    return self.namespaces_
+
+  def parse(self, cursor):
+    self.name_ = cursor.spelling
+    self.qualified_name_ = qualified_name(cursor)
+
+    parsers = { CursorKind.NAMESPACE : self._parse_namespace,
+                CursorKind.CLASS_DECL : self._parse_class, }
+
+    for child in cursor.get_children():
+      parse = parsers.get(child.kind)
+      if parse:
+        parse(child)
+
+  def _parse_namespace(self, cursor):
+    self.namespaces_.setdefault(cursor.spelling, Namespace()).parse(cursor)
+
+  def _parse_class(self, cursor):
+    self.classes.setdefault(cursor.spelling, Class()).parse(cursor)
+
+  def generate_code(self, transform):
+    for namespace in self.namespaces_.values():
+      namespace.generate_code(transform)
+    for class_ in self.classes.values():
+      class_.generate_code(transform)
+
+class TranslationUnit(object):
+  def __init__(self):
+    self.namespaces_ = { }
+    self.classes = { }
+
+  @property
+  def name(self):
+    return self.name_
+
+  @property
+  def namespaces(self):
+    return self.namespaces_
+
+  def parse(self, cursor):
+    self.name_ = cursor.spelling
+
+    parsers = { CursorKind.NAMESPACE : self._parse_namespace,
+                CursorKind.CLASS_DECL : self._parse_class, }
+
+    for child in cursor.get_children():
+      parse = parsers.get(child.kind)
+      if parse:
+        parse(child)
+
+  def _parse_namespace(self, cursor):
+    self.namespaces_.setdefault(cursor.spelling, Namespace()).parse(cursor)
+
+  def _parse_class(self, cursor):
+    self.classes.setdefault(cursor.spelling, Class()).parse(cursor)
+
+  def generate_code(self, transform):
+    for namespace in self.namespaces.values():
+      namespace.generate_code(transform)
+    for class_ in self.classes.values():
+      class_.generate_code(transform)
+
+def print_diagnostics(diagnostics):
+  severities = ['ignored', 'note', 'warning', 'error', 'fatal']
+  for index, diagnostic in enumerate(diagnostics):
+    print("%s:%u: %s: %s" % (diagnostic.location.file, diagnostic.location.line,
+                             severities[diagnostic.severity],
+                             diagnostic.spelling))
+
+def main(argc, argv):
+  parser = argparse.ArgumentParser(description = 'Binding Generator')
+  parser.add_argument('--namespace-scope', action = 'append', type = str,
+                      help = 'namespace to generate bindings for',
+                      metavar = 'NAMESPACE')
+  parser.add_argument('--header', metavar = 'HEADER', type = str,
+                      help = 'header containing the definitions to generate bindings for')
+  parser.add_argument('--name-transform', metavar = 'TRANSFORM', type = str,
+                      help = 'transformation to apply to the name')
+
+  (args, flags) = parser.parse_known_args(argv)
+
+  index = Index.create()
+  translation_unit = index.parse(args.header, ['-x', 'c++'] + flags[1:])
+
+  if translation_unit.diagnostics:
+    print_diagnostics(translation_unit.diagnostics)
+    if filter(lambda diagnostic: diagnostic.severity >= Diagnostic.Error,
+              translation_unit.diagnostics):
+      print('%u error%s found' % (len(translation_unit.diagnostics),
+                                  ["", "s"][len(translation_unit.diagnostics) > 1]))
+      return EXIT_FAILURE
+
+  TU = TranslationUnit()
+  TU.parse(translation_unit.cursor)
+  for namespace in args.namespace_scope:
+    # TODO(compnerd) properly handle the args.name_transform regex
+    transform = lambda name: name
+    TU.namespaces[namespace].generate_code(transform)
+
+if __name__ == '__main__':
+  code = main(len(sys.argv), sys.argv)
+  sys.exit(code)
+
